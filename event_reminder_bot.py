@@ -14,36 +14,32 @@ from dotenv import load_dotenv
 from bson import ObjectId
 from dateutil.parser import parse as parse_date
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load environment variables
 load_dotenv()
 
-# Bot configuration
 BOT_TOKEN: Optional[str] = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is not set in .env file")
 MONGO_URI: str = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DB_NAME: str = os.getenv("DB_NAME", "event_reminder_bot")
 
-# Initialize bot and dispatcher
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Initialize MongoDB client
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db = mongo_client[DB_NAME]
 
-# Define FSM states
 class CreateEventForm(StatesGroup):
     title = State()
     description = State()
     date_time = State()
     category = State()
 
-# Create main menu keyboard
+class CategoryForm(StatesGroup):
+    add_category = State()
+
 def get_main_menu() -> ReplyKeyboardMarkup:
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
@@ -54,7 +50,6 @@ def get_main_menu() -> ReplyKeyboardMarkup:
     )
     return keyboard
 
-# Create category keyboard
 async def get_category_keyboard(user_id: str) -> InlineKeyboardMarkup:
     categories = await db.categories.find({"user_id": user_id}).to_list(None)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -64,7 +59,6 @@ async def get_category_keyboard(user_id: str) -> InlineKeyboardMarkup:
     keyboard.inline_keyboard.append([InlineKeyboardButton(text="➕ Add Category", callback_data="add_category")])
     return keyboard
 
-# Register user
 async def register_user(user: types.User) -> None:
     await db.users.update_one(
         {"user_id": str(user.id)},
@@ -78,7 +72,6 @@ async def register_user(user: types.User) -> None:
         },
         upsert=True
     )
-    # Ensure default categories
     default_categories = ["Work", "Personal", "Health", "Other"]
     for cat in default_categories:
         await db.categories.update_one(
@@ -87,7 +80,6 @@ async def register_user(user: types.User) -> None:
             upsert=True
         )
 
-# Create event
 async def create_event(user_id: str, title: str, description: str, date_time: datetime, category_id: str) -> ObjectId:
     event = {
         "user_id": user_id,
@@ -101,7 +93,6 @@ async def create_event(user_id: str, title: str, description: str, date_time: da
     result = await db.events.insert_one(event)
     return result.inserted_id
 
-# Get upcoming events
 async def get_upcoming_events(user_id: str) -> list:
     now = datetime.now(pytz.UTC)
     events = await db.events.find({
@@ -111,7 +102,6 @@ async def get_upcoming_events(user_id: str) -> list:
     }).sort("date_time", 1).to_list(None)
     return events
 
-# Get statistics
 async def get_statistics(user_id: str) -> dict:
     now = datetime.now(pytz.UTC)
     start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -144,7 +134,6 @@ async def get_statistics(user_id: str) -> dict:
         "most_used_count": most_used_count
     }
 
-# Background task for reminders
 async def reminder_task() -> None:
     while True:
         now = datetime.now(pytz.UTC)
@@ -173,9 +162,7 @@ async def reminder_task() -> None:
                 except Exception as e:
                     logger.error(f"Failed to send reminder to {user_id}: {e}")
         
-        await asyncio.sleep(60)  # Check every minute
 
-# Command handlers
 @dp.message(Command("start"))
 async def start_command(message: types.Message, state: FSMContext) -> None:
     await state.clear()
@@ -189,14 +176,13 @@ async def start_command(message: types.Message, state: FSMContext) -> None:
         reply_markup=get_main_menu()
     )
 
-# Main menu handlers
 @dp.message(lambda message: message.text == "📅 Create Event")
 async def create_event_start(message: types.Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer("Enter the event title:", reply_markup=types.ReplyKeyboardRemove())
     await state.set_state(CreateEventForm.title)
 
-@dp.message(lambda message: message.text == "🔔 Upcoming Events")
+@dp.message(lambda message: message.text == "🦁 Upcoming Events")
 async def upcoming_events(message: types.Message, state: FSMContext) -> None:
     await state.clear()
     if not message.from_user:
@@ -242,7 +228,6 @@ async def categories(message: types.Message, state: FSMContext) -> None:
     keyboard = await get_category_keyboard(str(message.from_user.id))
     await message.answer("Select a category or add a new one:", reply_markup=keyboard)
 
-# Create event FSM handlers
 @dp.message(CreateEventForm.title)
 async def process_title(message: types.Message, state: FSMContext) -> None:
     if not message.text:
@@ -268,6 +253,8 @@ async def process_date_time(message: types.Message, state: FSMContext) -> None:
         return
     try:
         date_time = parse_date(message.text)
+        if date_time.tzinfo is None:
+            date_time = pytz.UTC.localize(date_time)
         if date_time < datetime.now(pytz.UTC):
             await message.answer("Please enter a future date and time:")
             return
@@ -308,17 +295,16 @@ async def process_category(callback: types.CallbackQuery, state: FSMContext) -> 
         await state.clear()
     await callback.answer()
 
-# Category management
 @dp.callback_query(lambda c: c.data == "add_category")
 async def add_category_start(callback: types.CallbackQuery, state: FSMContext) -> None:
     if not callback.message:
         await callback.answer("Error: Message not available.")
         return
     await callback.message.answer("Enter the new category name:")
-    await state.set_state("add_category")
+    await state.set_state(CategoryForm.add_category)
     await callback.answer()
 
-@dp.message(lambda message: message.state == "add_category")
+@dp.message(CategoryForm.add_category)
 async def process_category_name(message: types.Message, state: FSMContext) -> None:
     if not message.text:
         await message.answer("Category name cannot be empty. Try again:")
@@ -345,10 +331,8 @@ async def process_category_name(message: types.Message, state: FSMContext) -> No
         await state.clear()
 
 async def main() -> None:
-    # Start reminder task
     asyncio.create_task(reminder_task())
     
-    # Start polling
     try:
         await dp.start_polling(bot)
     finally:
